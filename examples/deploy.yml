@@ -1,0 +1,31 @@
+# Copy to <app>/.github/workflows/deploy.yml and change the three marked lines.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+
+# Newest push wins: an older run still building is cancelled. (deploy.yml also refuses to
+# write a tag older than the one already deployed.)
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Your own checks — delete this job if the app has none yet.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    uses: TikTzuki/ci-templates/.github/workflows/deploy.yml@v1
+    with:
+      image: tiktuzki/my-app                                  # ← Docker Hub repo
+      manifest_file: charts/my-app/values-dev.yaml            # ← values file in tiktuzki-gitops
+      verify_url: https://my-app.tiktuzki.com/api/version     # ← or drop this line
+    secrets: inherit

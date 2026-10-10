@@ -1,0 +1,11 @@
+# Bumps the SHA-pinned actions in deploy.yml — one grouped PR a month. After merging, move
+# the v1 tag (see README) or callers keep the old pins.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

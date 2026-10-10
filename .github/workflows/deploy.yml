@@ -1,0 +1,204 @@
+# Build → gitops → (Argo CD pulls) → verify. One reusable workflow for every app.
+#
+# Same idea as the ewallet services' include of platform/sre/gitlab-ci-templates: the app
+# repo keeps a ~20-line caller and states only what is its own (image name, which values
+# file to bump). Everything about HOW is here, versioned by tag.
+#
+#   build    <image>:<sha8> + :latest, Docker Hub, GHA layer cache
+#   deploy   set the image tag in <manifest_file> of the gitops repo, commit, push
+#   verify   (optional) wait until <verify_url> answers with <sha8> in its body
+#
+# CI never talks to the cluster. Argo CD pulls from the gitops repo; rollback = revert
+# the tag commit there.
+#
+# Secrets, passed with `secrets: inherit`:
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#   GITOPS_DEPLOY_KEY   private half of THE deploy key (write) on the gitops repo — one key,
+#                       every app. Only the `deploy` job sees it, and that job runs no app
+#                       code: checkout of the gitops repo, a sed, git push.
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Image without tag, e.g. tiktuzki/x-hrm"
+        type: string
+        required: true
+      manifest_file:
+        description: "Values file in the gitops repo, e.g. charts/x-hrm/values-dev.yaml"
+        type: string
+        required: true
+      tag_path:
+        description: "yq path of the tag inside manifest_file"
+        type: string
+        default: .image.tag
+      gitops_repo:
+        type: string
+        default: TikTzuki/tiktuzki-gitops
+      gitops_branch:
+        type: string
+        default: main
+      context:
+        description: "Docker build context"
+        type: string
+        default: .
+      dockerfile:
+        description: "Path to the Dockerfile; empty = <context>/Dockerfile"
+        type: string
+        default: ""
+      platforms:
+        description: "node1 is amd64"
+        type: string
+        default: linux/amd64
+      build_args:
+        description: "Extra build args, one KEY=value per line. GIT_SHA=<sha8> is always passed."
+        type: string
+        default: ""
+      verify_url:
+        description: "URL whose body contains the deployed sha8 (e.g. /api/version). Empty = skip verify."
+        type: string
+        default: ""
+      verify_timeout_minutes:
+        type: number
+        default: 15
+    outputs:
+      tag:
+        value: ${{ jobs.build.outputs.tag }}
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      # Exactly 8 chars (not --short, which grows when ambiguous): the image tag, the value in
+      # gitops and what verify_url reports must be the same string.
+      - id: tag
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: |
+            ${{ inputs.image }}:${{ steps.tag.outputs.tag }}
+            ${{ inputs.image }}:latest
+          build-args: |
+            GIT_SHA=${{ steps.tag.outputs.tag }}
+            ${{ inputs.build_args }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ inputs.image }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # One writer per values file, queued not cancelled: two apps share the gitops repo, two
+    # runs of one app must not interleave.
+    concurrency:
+      group: gitops-${{ inputs.gitops_repo }}-${{ inputs.manifest_file }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      FILE: ${{ inputs.manifest_file }}
+      TAG_PATH: ${{ inputs.tag_path }}
+      GITOPS_REPO: ${{ inputs.gitops_repo }}
+      BRANCH: ${{ inputs.gitops_branch }}
+      APP: ${{ github.event.repository.name }}
+      SOURCE: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+    steps:
+      # App history, only to tell whether what is deployed is NEWER than this run (below).
+      - uses: actions/checkout@v4
+        with:
+          path: app
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops_repo }}
+          ref: ${{ inputs.gitops_branch }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+      - name: Set ${{ inputs.tag_path }} = ${{ needs.build.outputs.tag }} in ${{ inputs.manifest_file }}
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          [ -f "$FILE" ] || { echo "::error::$FILE not found in $GITOPS_REPO"; exit 1; }
+          cur=$(yq "$TAG_PATH" "$FILE")
+          [ "$cur" != "null" ] || { echo "::error::$TAG_PATH not found in $FILE"; exit 1; }
+          [ "$cur" = "$TAG" ] && { echo "already at $TAG"; exit 0; }
+
+          # A slower, OLDER run must not overwrite a newer tag. Deployed commit contains ours
+          # → we are stale, skip. Unknown tag (hand-built, other branch) → go ahead.
+          if full=$(git -C ../app rev-parse --verify --quiet "$cur^{commit}") \
+             && git -C ../app merge-base --is-ancestor "$GITHUB_SHA" "$full"; then
+            echo "::notice::$FILE is at $cur, which already contains ${GITHUB_SHA::8} — skipping"
+            exit 0
+          fi
+
+          # Edit that one line in place: `yq -i` re-flows the file and loses formatting. The
+          # line is `<last key of tag_path>: <current value>` — must be exactly one such line
+          # (yq's `line` operator is no help: it counts from the comment above the key).
+          key="${TAG_PATH##*.}"
+          pat="^([[:space:]]*${key}:[[:space:]]*)[\"']?${cur}[\"']?([[:space:]]+#.*)?$"
+          n=$(grep -cE "$pat" "$FILE" || true)
+          [ "$n" = 1 ] || { echo "::error::expected one '$key: $cur' line in $FILE, found $n"; exit 1; }
+          sed -i -E "s/$pat/\1\"$TAG\"\2/" "$FILE"
+          [ "$(yq "$TAG_PATH" "$FILE")" = "$TAG" ] || { echo "::error::could not set $TAG_PATH"; git diff; exit 1; }
+          [ "$(git diff --numstat | awk '{s+=$1+$2} END {print s}')" = 2 ] || { echo "::error::more than one line changed"; git diff; exit 1; }
+
+          git config user.name "ci-templates deploy"
+          git config user.email "ci-templates-deploy@users.noreply.github.com"
+          git commit -qam "chore: update $APP image tag to $TAG" \
+            -m "From $SOURCE"
+          # Shared repo: another app may have pushed in between → rebase, retry.
+          for i in 1 2 3 4 5; do
+            git push -q origin "HEAD:$BRANCH" && { git log --oneline -1; exit 0; }
+            sleep $((i * 3))
+            # Someone else changed the SAME line → a conflict, not a race: stop, let a human look.
+            git pull -q --rebase origin "$BRANCH" || { git rebase --abort || true; echo "::error::rebase onto $GITOPS_REPO failed"; exit 1; }
+          done
+          echo "::error::push to $GITOPS_REPO failed"; exit 1
+
+  verify:
+    needs: [build, deploy]
+    if: inputs.verify_url != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      URL: ${{ inputs.verify_url }}
+      MINUTES: ${{ inputs.verify_timeout_minutes }}
+    steps:
+      - name: Wait for ${{ needs.build.outputs.tag }} at ${{ inputs.verify_url }}
+        run: |
+          # Argo CD polls gitops (~3 min), then the rollout and readiness probes.
+          deadline=$((SECONDS + MINUTES * 60))
+          while [ $SECONDS -lt $deadline ]; do
+            body=$(curl -fsS --max-time 10 "$URL" 2>/dev/null || true)
+            case "$body" in *"$TAG"*) echo "live: $TAG"; exit 0 ;; esac
+            echo "waiting… ($(printf %s "$body" | head -c 120))"
+            sleep 20
+          done
+          echo "::error::$TAG not live at $URL after $MINUTES min — check Argo CD"; exit 1

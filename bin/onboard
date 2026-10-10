@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Give an app repo the secrets deploy.yml needs. Personal GitHub accounts have no org-level
+# secrets, so every app repo carries its own copy — this keeps that one command.
+#
+#   pass-cli run --env-file ~/.config/athena/env.tpl -- bin/onboard TikTzuki/<repo> [...]
+#
+# Reads DOCKERHUB_USERNAME, DOCKERHUB_TOKEN and GITOPS_DEPLOY_KEY from the environment
+# (pass-cli injects them from pass://athena/...); pipes each into `gh secret set`. Values are
+# never echoed, never written to disk, never passed as an argument (argv shows in `ps`).
+set -euo pipefail
+
+GITOPS_REPO="${GITOPS_REPO:-TikTzuki/tiktuzki-gitops}"
+NAMES=(DOCKERHUB_USERNAME DOCKERHUB_TOKEN GITOPS_DEPLOY_KEY)
+
+[[ $# -ge 1 ]] || { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+command -v gh >/dev/null || { echo "onboard: gh not found" >&2; exit 1; }
+gh auth status >/dev/null 2>&1 || { echo "onboard: run gh auth login first" >&2; exit 3; }
+for n in "${NAMES[@]}"; do
+    [[ -n "${!n:-}" ]] || { echo "onboard: $n is not set — run me under pass-cli run" >&2; exit 1; }
+done
+[[ "$GITOPS_DEPLOY_KEY" == *"PRIVATE KEY"* ]] || { echo "onboard: GITOPS_DEPLOY_KEY doesn't look like an SSH private key" >&2; exit 1; }
+
+# The key only works if its public half is a WRITE deploy key on the gitops repo.
+if ! gh api "repos/$GITOPS_REPO/keys" --jq '.[] | select(.read_only == false) | .title' | grep -q .; then
+    echo "onboard: $GITOPS_REPO has no deploy key with write access — add the .pub first" >&2; exit 1
+fi
+
+status=0
+for repo in "$@"; do
+    for n in "${NAMES[@]}"; do
+        if printf '%s' "${!n}" | gh secret set "$n" -R "$repo" >/dev/null; then
+            echo "$repo  $n  set"
+        else
+            echo "$repo  $n  FAILED" >&2; status=2
+        fi
+    done
+done
+exit $status
